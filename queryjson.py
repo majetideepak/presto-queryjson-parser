@@ -13,6 +13,8 @@ def create_parser():
   parser.add_option('--stagestate', action='store_true', default=False, help='Collect and print stage status information')
   parser.add_option('--opwall', action='store', default=0, type="int", dest="opwall_s", help='Minimum Operator Wall time in seconds to show operator details (Default: 0)')
   parser.add_option('--sortby', action='store', default='getOutputWall', type="string", dest="sort_key", help='Sort field (Default: \'getOutputWall\'. Other fields: \'addInputWall\', \'blockedWall\')')
+  parser.add_option('--runtimestats', action='store_true', default='False', help='Get only the runtime stats where max > 1 second')
+  parser.add_option('--printstages', action='store_true', default='False', help='Print the output stage fragments (plan)')
   return parser
 
 def time_val(tstr):
@@ -60,6 +62,28 @@ def printSorted(queries, sort_key):
     else:
       print("Skipping Operators. OutputWall too small for operator collection.")
 
+def printPlan(plan):
+    print(plan['id'] + " " + plan['name'])
+    print(plan['identifier'])
+    if not plan['details']:
+      print(plan['details'])
+    for child in plan['children']:
+      printPlan(child)
+
+def printstages(outputStage):
+    print(outputStage['stageId'])
+    plan = json.loads(outputStage['plan']['jsonRepresentation'])
+    printPlan(plan)
+    for stage in outputStage['subStages']:
+        printstages(stage)
+
+def printRuntimeStats(stats):
+  for key, value in stats.items():
+    if (key.endswith('runningGetOutputWallNanos') and  value['unit'] == 'NANO' and value['max'] / 1000000000 > 1):
+      print(key + ": "  + str(value['sum'] / 1000000000) + " " +
+                          str(value['min'] / 1000000000) + " " +
+                          str(value['max'] / 1000000000))
+
 def main():
   parser = create_parser()
   (options, args) = parser.parse_args()
@@ -86,6 +110,12 @@ def main():
     root['file'] = file;
     if (data['state'] == 'FAILED'):
       failed.append(file)
+
+    if (options.runtimestats) :
+      printRuntimeStats(data['queryStats']['runtimeStats'])
+
+    if (options.printstages) :
+      printstages(data['outputStage'])
 
     if (options.stagestate) :
       stages = []
