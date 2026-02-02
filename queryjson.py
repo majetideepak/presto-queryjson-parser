@@ -13,9 +13,17 @@ def create_parser():
   parser.add_option('--stagestate', action='store_true', default=False, help='Collect and print stage status information')
   parser.add_option('--opwall', action='store', default=0, type="int", dest="opwall_s", help='Minimum Operator Wall time in seconds to show operator details (Default: 0)')
   parser.add_option('--sortby', action='store', default='getOutputWall', type="string", dest="sort_key", help='Sort field (Default: \'getOutputWall\'. Other fields: \'addInputWall\', \'blockedWall\')')
-  parser.add_option('--runtimestats', action='store_true', default='False', help='Get only the runtime stats where max > 1 second')
-  parser.add_option('--printstages', action='store_true', default='False', help='Print the output stage fragments (plan)')
+  parser.add_option('--runtimestats', action='store_true', default=False, help='Print the query runtime stats. Narrow the keys with --prefix and/or --suffix')
+  parser.add_option('--prefix', action='append', default=None, dest='prefixes', metavar='P[,P...]', help='Only show runtime stats whose key starts with one of these prefixes, e.g. \'S2-TableScan,S1-Exchange\' (comma separated, repeatable)')
+  parser.add_option('--suffix', action='append', default=None, dest='suffixes', metavar='S[,S...]', help='Only show runtime stats whose key ends with one of these suffixes, e.g. \'storageReadBytes,ramReadBytes\' (comma separated, repeatable)')
+  parser.add_option('--printstages', action='store_true', default=False, help='Print the output stage fragments (plan)')
   return parser
+
+def split_opt_list(values):
+  items = []
+  for value in values or []:
+    items += [item for item in value.split(',') if item]
+  return items
 
 def time_val(tstr):
   time = 0
@@ -42,47 +50,92 @@ def printFailed(queries):
 
 def printSorted(queries, sort_key):
   sorted_queries = sorted(queries, key = lambda x: x[0], reverse = True) 
-  print('Sorted Queries')
+  #print('Sorted Queries')
   for query in sorted_queries:
+    print('\n**********\nfile : ' + query[1]['file'])
+    print('query : ' + query[1]['query'].split(':')[0][3:])
     print('execTime : ' + query[1]['execTime'] + '(' + str(query[0])  + 's)')
-    print('file : ' + query[1]['file'])
     print('totalTasks : ' + str(query[1]['totalTasks']))
     print('peakRunningTasks : ' + str(query[1]['peakRunningTasks']))
     print('totalCpuTime : ' + str(query[1]['totalCpuTime']))
     print('totalBlockedTime : ' + query[1]['totalBlockedTime'])
     print('shuffledDataSize : ' + query[1]['shuffledDataSize'])
-    if ('stageState' in query[1]):
-      print('Stage State')
-      for state in query[1]['stageState']:
-        print(state[1])
-    if (len(query[1]['opSummaries']) > 0):
-      print('Top Operators sorted by ' + sort_key)
-      for summary in query[1]['opSummaries']:
-        print(summary[1])
-    else:
-      print("Skipping Operators. OutputWall too small for operator collection.")
+    if (query[1]['runtimeStats']):
+      print('runtimeStats :\n' + query[1]['runtimeStats'])
+    #if ('stageState' in query[1]):
+    #  print('Stage State')
+    #  for state in query[1]['stageState']:
+    #    print(state[1])
+    #if (len(query[1]['opSummaries']) > 0):
+    #  print('Top Operators sorted by ' + sort_key)
+    #  for summary in query[1]['opSummaries']:
+    #    print(summary[1])
+    #else:
+    #  print("Skipping Operators. OutputWall too small for operator collection.")
 
 def printPlan(plan):
-    print(plan['id'] + " " + plan['name'])
-    print(plan['identifier'])
-    if not plan['details']:
+    print(plan['id'] + " " + plan['name'] + " " + plan['identifier'])
+    if plan['details']:
       print(plan['details'])
     for child in plan['children']:
       printPlan(child)
 
-def printstages(outputStage):
-    print(outputStage['stageId'])
+def printstages(outputStage, stages):
     plan = json.loads(outputStage['plan']['jsonRepresentation'])
-    printPlan(plan)
+    stageName = outputStage['stageId']
+    stage = stageName[stageName.index('.') + 1:]; 
+    if stage in stages:
+      print(stage)
+      printPlan(plan)
     for stage in outputStage['subStages']:
-        printstages(stage)
+        printstages(stage, stages)
 
-def printRuntimeStats(stats):
-  for key, value in stats.items():
-    if (key.endswith('runningGetOutputWallNanos') and  value['unit'] == 'NANO' and value['max'] / 1000000000 > 1):
-      print(key + ": "  + str(value['sum'] / 1000000000) + " " +
-                          str(value['min'] / 1000000000) + " " +
-                          str(value['max'] / 1000000000))
+def key_matches(key, prefixes, suffixes):
+  if (not prefixes and not suffixes):
+    return True
+  return (any(key.startswith(prefix) for prefix in prefixes) or
+          any(key.endswith(suffix) for suffix in suffixes))
+
+def stat_val(val, unit):
+  if (unit == 'NANO'):
+    return '{:.2f}s'.format(val / 1000000000)
+  if (unit == 'BYTE'):
+    return '{:.2f}MB'.format(val / 1048576)
+  return str(val)
+
+def stage_of(key):
+  # Stage scoped keys are named 'S<stageId>-<operator>.<...>', e.g. 'S2-TableScan.0.overreadBytes'.
+  # Query level keys such as 'planAndOptimizeTimeNanosOnCpu' belong to no stage.
+  if (not key.startswith('S') or '-' not in key):
+    return None
+  stageId = key[1:key.index('-')]
+  return stageId if stageId.isdigit() else None
+
+# Matches every key unless narrowed, e.g. --prefix S2-TableScan,S1-Exchange
+# or --suffix runningGetOutputWallNanos,storageReadBytes
+def printRuntimeStats(stats, prefixes, suffixes):
+  stages = set()
+  runtimeStats = ""
+  for key in sorted(stats):
+    value = stats[key]
+    if (not key_matches(key, prefixes, suffixes)):
+      continue
+    unit = value['unit']
+    runtimeStats += (key + ": "  + stat_val(value['sum'], unit) + " " +
+                        str(value['count']) + " " +
+                        stat_val(value['min'], unit) + " " +
+                        stat_val(value['max'], unit)) + "\n"
+    stage = stage_of(key)
+    if (stage):
+      stages.add(stage)
+  return stages, runtimeStats;
+
+def read_file_names(filepath):
+  found_entries = []
+  with open(filepath, 'r') as f:
+    for line in f:
+      found_entries.append(line)
+  return found_entries
 
 def main():
   parser = create_parser()
@@ -91,10 +144,19 @@ def main():
   if (len(args) != 1):
       sys.exit("Specify the input json file or directory.")
 
+  prefixes = split_opt_list(options.prefixes)
+  suffixes = split_opt_list(options.suffixes)
+  runtimestats = options.runtimestats or bool(prefixes) or bool(suffixes)
+
   jsonfiles = []
+ 
+#  names = read_file_names('/Users/deepak/Downloads/Bolt/500cppjson/jsonfiles.txt') 
 
   if os.path.isfile(args[0]):
     jsonfiles.append(args[0])
+#  elif names:
+#    for file in names:
+#      jsonfiles.append((args[0] + "/" + file).rstrip());
   else:
     for subdir, dirs, files in os.walk(args[0]):
       for file in files:
@@ -103,19 +165,25 @@ def main():
   failed = []
   queries = []
   for file in jsonfiles:
-    jsonfile = open(file)
-    data = json.load(jsonfile)
+    if (file[-4:] != 'json'):
+      continue
+    
+    #print(file)
+    with open(file) as jsonfile:
+      data = json.load(jsonfile)
 
     root = {}
     root['file'] = file;
     if (data['state'] == 'FAILED'):
       failed.append(file)
 
-    if (options.runtimestats) :
-      printRuntimeStats(data['queryStats']['runtimeStats'])
+    stages = set();
+    runtimeStats = ""
+    if (runtimestats) :
+      stages, runtimeStats = printRuntimeStats(data['queryStats']['runtimeStats'], prefixes, suffixes)
 
     if (options.printstages) :
-      printstages(data['outputStage'])
+      printstages(data['outputStage'], stages)
 
     if (options.stagestate) :
       stages = []
@@ -142,6 +210,7 @@ def main():
     root['totalCpuTime'] = queryStats['totalCpuTime'];
     root['totalBlockedTime'] = queryStats['totalBlockedTime'];
     root['shuffledDataSize'] = queryStats['shuffledDataSize']; 
+    root['runtimeStats'] = runtimeStats;
 
     opSummaries = queryStats['operatorSummaries'];
     summaries = []
@@ -160,7 +229,6 @@ def main():
     
     sorted_summaries = sorted(summaries, key = lambda x: x[0], reverse = True)
     root['opSummaries'] = sorted_summaries;
-    jsonfile.close()
     queries.append((timeVal, root));
 
   if (len(failed) > 0):
