@@ -13,8 +13,8 @@ def create_parser():
   parser.add_option('--stagestate', action='store_true', default=False, help='Collect and print stage status information')
   parser.add_option('--opwall', action='store', default=0, type="int", dest="opwall_s", help='Minimum Operator Wall time in seconds to show operator details (Default: 0)')
   parser.add_option('--sortby', action='store', default='getOutputWall', type="string", dest="sort_key", help='Sort field (Default: \'getOutputWall\'. Other fields: \'addInputWall\', \'blockedWall\')')
-  parser.add_option('--runtimestats', action='store_true', default='False', help='Get only the runtime stats where max > 1 second')
-  parser.add_option('--printstages', action='store_true', default='False', help='Print the output stage fragments (plan)')
+  parser.add_option('--runtimestats', action='store_true', default=False, help='Get only the runtime stats where max > 1 second')
+  parser.add_option('--printstages', action='store_true', default=False, help='Print the output stage fragments (plan)')
   return parser
 
 def time_val(tstr):
@@ -44,13 +44,14 @@ def printSorted(queries, sort_key):
   sorted_queries = sorted(queries, key = lambda x: x[0], reverse = True) 
   print('Sorted Queries')
   for query in sorted_queries:
+    print('\n**********\nfile : ' + query[1]['file'])
     print('execTime : ' + query[1]['execTime'] + '(' + str(query[0])  + 's)')
-    print('file : ' + query[1]['file'])
     print('totalTasks : ' + str(query[1]['totalTasks']))
     print('peakRunningTasks : ' + str(query[1]['peakRunningTasks']))
     print('totalCpuTime : ' + str(query[1]['totalCpuTime']))
     print('totalBlockedTime : ' + query[1]['totalBlockedTime'])
     print('shuffledDataSize : ' + query[1]['shuffledDataSize'])
+    print('runtimeStats :\n' + query[1]['runtimeStats'])
     if ('stageState' in query[1]):
       print('Stage State')
       for state in query[1]['stageState']:
@@ -63,26 +64,39 @@ def printSorted(queries, sort_key):
       print("Skipping Operators. OutputWall too small for operator collection.")
 
 def printPlan(plan):
-    print(plan['id'] + " " + plan['name'])
-    print(plan['identifier'])
-    if not plan['details']:
+    print(plan['id'] + " " + plan['name'] + " " + plan['identifier'])
+    if plan['details']:
       print(plan['details'])
     for child in plan['children']:
       printPlan(child)
 
-def printstages(outputStage):
-    print(outputStage['stageId'])
+def printstages(outputStage, stages):
     plan = json.loads(outputStage['plan']['jsonRepresentation'])
-    printPlan(plan)
+    stageName = outputStage['stageId']
+    stage = stageName[stageName.index('.') + 1:]; 
+    if stage in stages:
+      print(stage)
+      printPlan(plan)
     for stage in outputStage['subStages']:
-        printstages(stage)
+        printstages(stage, stages)
 
 def printRuntimeStats(stats):
+  stages = set()
+  runtimeStats = ""
   for key, value in stats.items():
-    if (key.endswith('runningGetOutputWallNanos') and  value['unit'] == 'NANO' and value['max'] / 1000000000 > 1):
-      print(key + ": "  + str(value['sum'] / 1000000000) + " " +
+    if ((key.endswith('runningGetOutputWallNanos') or key.endswith('runningAddInputWallNanos')) and  value['unit'] == 'NANO' and value['max'] / 1000000000 > 1):
+      runtimeStats += (key + ": "  + str(value['sum'] / 1000000000) + " " +
                           str(value['min'] / 1000000000) + " " +
-                          str(value['max'] / 1000000000))
+                          str(value['max'] / 1000000000)) + "\n"
+      stages.add(key[1:key.index('-')])
+  return stages, runtimeStats;
+
+def read_file_names(filepath):
+  found_entries = []
+  with open(filepath, 'r') as f:
+    for line in f:
+      found_entries.append(line)
+  return found_entries
 
 def main():
   parser = create_parser()
@@ -92,9 +106,14 @@ def main():
       sys.exit("Specify the input json file or directory.")
 
   jsonfiles = []
+ 
+#  names = read_file_names('/Users/deepak/Downloads/Bolt/500cppjson/jsonfiles.txt') 
 
   if os.path.isfile(args[0]):
     jsonfiles.append(args[0])
+#  elif names:
+#    for file in names:
+#      jsonfiles.append((args[0] + "/" + file).rstrip());
   else:
     for subdir, dirs, files in os.walk(args[0]):
       for file in files:
@@ -103,19 +122,21 @@ def main():
   failed = []
   queries = []
   for file in jsonfiles:
-    jsonfile = open(file)
-    data = json.load(jsonfile)
+    print(file)
+    with open(file) as jsonfile:
+      data = json.load(jsonfile)
 
     root = {}
     root['file'] = file;
     if (data['state'] == 'FAILED'):
       failed.append(file)
 
+    stages = set();
     if (options.runtimestats) :
-      printRuntimeStats(data['queryStats']['runtimeStats'])
+      stages, runtimeStats = printRuntimeStats(data['queryStats']['runtimeStats'])
 
     if (options.printstages) :
-      printstages(data['outputStage'])
+      printstages(data['outputStage'], stages)
 
     if (options.stagestate) :
       stages = []
@@ -142,6 +163,7 @@ def main():
     root['totalCpuTime'] = queryStats['totalCpuTime'];
     root['totalBlockedTime'] = queryStats['totalBlockedTime'];
     root['shuffledDataSize'] = queryStats['shuffledDataSize']; 
+    root['runtimeStats'] = runtimeStats;
 
     opSummaries = queryStats['operatorSummaries'];
     summaries = []
@@ -160,7 +182,6 @@ def main():
     
     sorted_summaries = sorted(summaries, key = lambda x: x[0], reverse = True)
     root['opSummaries'] = sorted_summaries;
-    jsonfile.close()
     queries.append((timeVal, root));
 
   if (len(failed) > 0):
